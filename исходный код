@@ -1,0 +1,1932 @@
+# =================================================================
+# RBX Launcher v3.1 — лаунчер Roblox в стиле Bloxstrap
+# Иконка встроена: ищет icon.ico рядом, иначе рисует сам
+# =================================================================
+import os
+import re
+import io
+import sys
+import json
+import time
+import ctypes
+import shutil
+import colorsys
+import threading
+import subprocess
+import webbrowser
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Optional
+import customtkinter as ctk
+from tkinter import BooleanVar, messagebox, filedialog, PhotoImage
+import tkinter.font as tkfont
+from PIL import Image, ImageDraw, ImageFont, ImageChops
+
+# =================================================================
+# ПУТИ (работает и как скрипт, и как .exe)
+# =================================================================
+def app_dir() -> Path:
+    base = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "RBX_Launcher"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+def res_dir() -> Path:
+    return Path(getattr(sys, "_MEIPASS", None) or app_dir())
+
+# =================================================================
+# ПАЛИТРА
+# =================================================================
+BG      = "#0B0E14"
+SIDEBAR = "#0F131C"
+CARD    = "#151A24"
+CARD2   = "#1C2331"
+BORDER  = "#252D3F"
+TEXT    = "#E9EDF5"
+MUTED   = "#8B94A7"
+GREEN   = "#22C55E"
+GREEN_H = "#16A34A"
+RED     = "#EF4444"
+AMBER   = "#F59E0B"
+
+ACCENTS = {
+    "Синий":      "#3D8BFF",
+    "Фиолетовый": "#8B5CF6",
+    "Розовый":    "#EC4899",
+    "Зелёный":    "#22C55E",
+    "Оранжевый":  "#F59E0B",
+}
+
+def rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+def hx(t):
+    return "#%02X%02X%02X" % tuple(max(0, min(255, int(v))) for v in t)
+
+def mix(a, b, t):
+    ra, rb = rgb(a), rgb(b)
+    return hx(tuple(ra[i] + (rb[i] - ra[i]) * t for i in range(3)))
+
+def hue_shift(h, dh):
+    r, g, b = [v / 255 for v in rgb(h)]
+    hh, s, v = colorsys.rgb_to_hsv(r, g, b)
+    r, g, b = colorsys.hsv_to_rgb((hh + dh) % 1.0, min(1, s * 1.05), v)
+    return hx((r * 255, g * 255, b * 255))
+
+_FONTS = []
+def F(size, weight="normal"):
+    f = ctk.CTkFont(family="Segoe UI", size=size, weight=weight)
+    _FONTS.append((f, size))
+    return f
+
+def pil_font(size, bold=True):
+    names = ("segoeuib.ttf", "arialbd.ttf", "arial.ttf") if bold else ("segoeui.ttf", "arial.ttf")
+    for n in names:
+        try:
+            return ImageFont.truetype(n, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+# =================================================================
+# ГРАФИКА: баннер, лого, аватарки, курсоры, ИКОНКА
+# =================================================================
+def make_banner(w, h, accent):
+    w, h = max(200, int(w)), max(80, int(h))
+    base = Image.new("RGB", (w, h))
+    d = ImageDraw.Draw(base)
+    c1, c2, c3 = accent, hue_shift(accent, 0.07), hue_shift(accent, 0.16)
+    for x in range(w):
+        t = x / max(1, w - 1)
+        c = mix(c1, c2, t * 2) if t < 0.5 else mix(c2, c3, (t - 0.5) * 2)
+        d.line([(x, 0), (x, h)], fill=rgb(c))
+    ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    od.ellipse([w - 260, -90, w + 60, 230], fill=rgb(mix(accent, "#FFFFFF", 0.35)) + (70,))
+    od.ellipse([w - 430, 40, w - 160, 300], fill=rgb(hue_shift(accent, 0.12)) + (60,))
+    for i in range(-h, w, 28):
+        od.line([(i, 0), (i + h, h)], fill=(255, 255, 255, 12), width=2)
+    for x in range(w):
+        a = int(195 * max(0.0, 1 - x / (w * 0.62)))
+        od.line([(x, 0), (x, h)], fill=(8, 10, 16, a))
+    return Image.alpha_composite(base.convert("RGBA"), ov).convert("RGB")
+
+def make_logo(accent, size=44):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, size - 1, size - 1], radius=max(4, int(size * 0.27)), fill=rgb(accent))
+    d.rounded_rectangle([0, 0, size - 1, size // 2], radius=max(4, int(size * 0.27)),
+                        fill=rgb(mix(accent, "#FFFFFF", 0.18)))
+    d.text((size / 2, size / 2 + 1), "R", font=pil_font(int(size * 0.55)), fill=(255, 255, 255), anchor="mm")
+    return img
+
+def make_avatar(name, seed, size=84):
+    h = (hash(seed) % 1000) / 1000.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.62, 0.85)
+    col = hx((r * 255, g * 255, b * 255))
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, size - 1, size - 1], radius=18, fill=rgb(col))
+    d.rounded_rectangle([0, 0, size - 1, size // 2], radius=18, fill=rgb(mix(col, "#FFFFFF", 0.14)))
+    letter = (name or "R").strip()[:1].upper() or "R"
+    d.text((size / 2, size / 2 + 2), letter, font=pil_font(int(size * 0.45)), fill=(255, 255, 255), anchor="mm")
+    return img
+
+ARROW_PTS = [(0.06, 0.02), (0.06, 0.78), (0.26, 0.60), (0.38, 0.92),
+             (0.52, 0.86), (0.40, 0.55), (0.68, 0.55)]
+
+def make_cursor(kind, size, accent):
+    s = max(16, int(size))
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    pts = [(x * s, y * s) for x, y in ARROW_PTS]
+    if kind in ("white", "black", "neon"):
+        fill = {"white": (255, 255, 255), "black": (20, 20, 24), "neon": rgb(accent)}[kind]
+        outline = (255, 255, 255) if kind == "black" else (0, 0, 0)
+        if kind == "neon":
+            glow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+            gd = ImageDraw.Draw(glow)
+            big = [(x * s * 1.12 - s * 0.05, y * s * 1.12 - s * 0.05) for x, y in ARROW_PTS]
+            gd.polygon(big, fill=rgb(accent) + (90,))
+            img = Image.alpha_composite(img, glow)
+            d = ImageDraw.Draw(img)
+        d.polygon(pts, fill=fill, outline=outline, width=max(1, s // 24))
+    elif kind == "cross":
+        c = rgb(accent)
+        w = max(2, s // 14)
+        d.line([(s / 2, s * 0.08), (s / 2, s * 0.38)], fill=c, width=w)
+        d.line([(s / 2, s * 0.62), (s / 2, s * 0.92)], fill=c, width=w)
+        d.line([(s * 0.08, s / 2), (s * 0.38, s / 2)], fill=c, width=w)
+        d.line([(s * 0.62, s / 2), (s * 0.92, s / 2)], fill=c, width=w)
+        d.ellipse([s * 0.42, s * 0.42, s * 0.58, s * 0.58], fill=c)
+    elif kind == "dot":
+        c = rgb(accent)
+        d.ellipse([s * 0.28, s * 0.28, s * 0.72, s * 0.72], outline=c, width=max(2, s // 16))
+        d.ellipse([s * 0.42, s * 0.42, s * 0.58, s * 0.58], fill=c)
+    else:
+        d.polygon([(s * 0.2, s * 0.1), (s * 0.2, s * 0.7), (s * 0.62, s * 0.45)], fill=rgb(accent))
+    return img
+
+CURSOR_PRESETS = [("white", "Классика"), ("black", "Чёрный"), ("neon", "Неон"),
+                  ("cross", "Прицел"), ("dot", "Точка"), ("minimal", "Минимал")]
+
+def make_icon_master(s=512):
+    """Иконка приложения: градиентная плитка с буквой R."""
+    top, mid, bot = "#4FA3FF", "#3D8BFF", "#8B5CF6"
+    grad = Image.new("RGB", (s, s))
+    gd = ImageDraw.Draw(grad)
+    for y in range(s):
+        t = y / (s - 1)
+        c = rgb(mix(top, mid, t / 0.55)) if t < 0.55 else rgb(mix(mid, bot, (t - 0.55) / 0.45))
+        gd.line([(0, y), (s, y)], fill=c)
+
+    mask = Image.new("L", (s, s), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.235), fill=255)
+    tile = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    tile.paste(grad, (0, 0), mask)
+
+    ov = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
+    od.ellipse([s * 0.45, -s * 0.25, s * 1.05, s * 0.45], fill=(255, 255, 255, 46))
+    od.ellipse([s * 0.62, s * 0.02, s * 1.02, s * 0.40], fill=(255, 255, 255, 38))
+    od.ellipse([-s * 0.30, s * 0.55, s * 0.50, s * 1.25], fill=(20, 10, 60, 80))
+    step = max(8, s // 9)
+    for i in range(-s, s, step):
+        od.line([(i, 0), (i + s, s)], fill=(255, 255, 255, 12), width=max(2, s // 72))
+    od.rounded_rectangle([s * 0.05, s * 0.045, s * 0.95, s * 0.50],
+                         radius=int(s * 0.19), fill=(255, 255, 255, 24))
+    b = max(2, s // 96)
+    od.rounded_rectangle([b, b, s - 1 - b, s - 1 - b],
+                         radius=int(s * 0.235) - b, outline=(255, 255, 255, 60), width=b)
+    ov.putalpha(ImageChops.multiply(ov.getchannel("A"), mask))
+    tile = Image.alpha_composite(tile, ov)
+
+    tl = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    td = ImageDraw.Draw(tl)
+    f = pil_font(int(s * 0.58))
+    cx, cy = s / 2, s * 0.545
+    td.text((cx + s * 0.012, cy + s * 0.020), "R", font=f, fill=(10, 14, 30, 120), anchor="mm")
+    td.text((cx, cy), "R", font=f, fill=(255, 255, 255, 255), anchor="mm")
+    tl.putalpha(ImageChops.multiply(tl.getchannel("A"), mask))
+    return Image.alpha_composite(tile, tl)
+
+def export_icon(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    m = make_icon_master(512)
+    m.resize((256, 256), Image.LANCZOS).save(folder / "icon.png")
+    m.save(folder / "icon.ico", format="ICO",
+           sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    return folder / "icon.ico"
+
+def find_or_make_icon(data_dir: Path) -> Optional[Path]:
+    for p in (res_dir() / "icon.ico", app_dir() / "icon.ico", data_dir / "icon.ico"):
+        if p.exists():
+            return p
+    try:
+        return export_icon(data_dir)
+    except Exception:
+        return None
+
+def setup_window_icon(window, data_dir: Path):
+    ico = find_or_make_icon(data_dir)
+    if not ico:
+        return
+    try:
+        window.iconbitmap(default=str(ico))
+    except Exception:
+        try:
+            window.iconbitmap(str(ico))
+        except Exception:
+            pass
+    png = ico.with_suffix(".png")
+    if png.exists():
+        try:
+            ph = PhotoImage(file=str(png))
+            window.iconphoto(True, ph)
+            window._icon_photo = ph
+        except Exception:
+            pass
+
+def set_taskbar_id():
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RBX.Launcher.v3")
+        except Exception:
+            pass
+
+# =================================================================
+# ЯДРО
+# =================================================================
+class RobloxCore:
+    DEFAULT_XML = """<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+\t<Item class="UserGameSettings" referent="RBX0">
+\t\t<Properties>
+\t\t\t<int name="SavedQualityLevel">0</int>
+\t\t\t<token name="ControlMode">2</token>
+\t\t\t<float name="MasterVolume">0.5</float>
+\t\t\t<bool name="Fullscreen">false</bool>
+\t\t</Properties>
+\t</Item>
+</roblox>
+"""
+    RENDER_FLAGS = {
+        "Direct3D 11": "FFlagDebugGraphicsPreferD3D11",
+        "Vulkan": "FFlagDebugGraphicsPreferVulkan",
+        "OpenGL": "FFlagDebugGraphicsPreferOpenGL",
+    }
+    MANAGED_FLAGS = ["DFIntTaskSchedulerTargetFps", "FFlagDebugDisplayFPS",
+                     "FFlagDisablePostFx"] + list(RENDER_FLAGS.values())
+
+    def __init__(self):
+        local = os.getenv("LOCALAPPDATA")
+        if not local:
+            raise EnvironmentError("Не удалось найти папку LOCALAPPDATA.")
+        self.roblox_root = Path(local) / "Roblox"
+        self.versions_dir = self.roblox_root / "Versions"
+        self.settings_xml = self.roblox_root / "GlobalBasicSettings_13.xml"
+        self.base_dir = app_dir()
+        self.data_dir = self.base_dir / "launcher_data"
+        self.backup_dir = self.data_dir / "backups"
+        self.mods_dir = self.backup_dir / "mods"
+        self.icons_dir = self.data_dir / "icons"
+        self.config_file = self.data_dir / "config.json"
+        for p in (self.data_dir, self.backup_dir, self.mods_dir, self.icons_dir):
+            p.mkdir(parents=True, exist_ok=True)
+
+    def get_latest_version_dir(self) -> Optional[Path]:
+        if not self.versions_dir.exists():
+            return None
+        valid = []
+        for folder in self.versions_dir.iterdir():
+            exe = folder / "RobloxPlayerBeta.exe"
+            if folder.is_dir() and exe.is_file():
+                valid.append((exe.stat().st_mtime, folder))
+        if not valid:
+            return None
+        valid.sort(key=lambda x: x[0], reverse=True)
+        return valid[0][1]
+
+    def sounds_dir(self):
+        v = self.get_latest_version_dir()
+        return v / "content" / "sounds" if v else None
+
+    def fonts_dir(self):
+        v = self.get_latest_version_dir()
+        return v / "content" / "fonts" if v else None
+
+    def cursors_dir(self):
+        v = self.get_latest_version_dir()
+        return v / "content" / "textures" / "Cursors" / "KeyboardMouse" if v else None
+
+    def list_sounds(self):
+        d = self.sounds_dir()
+        if not d or not d.exists():
+            return []
+        return sorted([f for f in d.iterdir() if f.suffix.lower() in (".wav", ".mp3", ".ogg")],
+                      key=lambda p: p.name)
+
+    def list_fonts(self):
+        d = self.fonts_dir()
+        if not d or not d.exists():
+            return []
+        return sorted([f for f in d.iterdir() if f.suffix.lower() in (".otf", ".ttf")], key=lambda p: p.name)
+
+    def list_cursors(self):
+        d = self.cursors_dir()
+        if not d or not d.exists():
+            return []
+        return sorted([f for f in d.iterdir() if f.suffix.lower() == ".png"], key=lambda p: p.name)
+
+    def _mod_backup(self, category, filename):
+        return self.mods_dir / category / filename
+
+    def is_modified(self, category, filename):
+        return self._mod_backup(category, filename).exists()
+
+    def replace_client_file(self, category, target: Path, data: bytes):
+        bak = self._mod_backup(category, target.name)
+        bak.parent.mkdir(parents=True, exist_ok=True)
+        if not bak.exists():
+            shutil.copy2(target, bak)
+        target.write_bytes(data)
+        return True
+
+    def restore_client_file(self, category, filename):
+        bak = self._mod_backup(category, filename)
+        if not bak.exists():
+            return False
+        base = {"sounds": self.sounds_dir(), "fonts": self.fonts_dir(), "cursors": self.cursors_dir()}[category]
+        if not base:
+            return False
+        base.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bak, base / filename)
+        bak.unlink()
+        return True
+
+    def restore_category(self, category):
+        d = self.mods_dir / category
+        if not d.exists():
+            return 0
+        n = 0
+        for bak in list(d.iterdir()):
+            if self.restore_client_file(category, bak.name):
+                n += 1
+        return n
+
+    @staticmethod
+    def ui_to_internal_quality(level):
+        level = max(1, min(10, int(level)))
+        return int(round(1 + (level - 1) * 20 / 9))
+
+    def ensure_settings_xml(self):
+        if self.settings_xml.exists():
+            return True
+        try:
+            self.roblox_root.mkdir(parents=True, exist_ok=True)
+            self.settings_xml.write_text(self.DEFAULT_XML, encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _set_prop(props, tag, name, value):
+        for el in props:
+            if el.tag == tag and el.attrib.get("name") == name:
+                el.text = value
+                return
+        ET.SubElement(props, tag, {"name": name}).text = value
+
+    def apply_xml_settings(self, graphics_level, shift_lock, volume, quiet=False):
+        if not self.ensure_settings_xml():
+            if not quiet:
+                messagebox.showerror("Ошибка", "Не удалось создать файл настроек Roblox.")
+            return False
+        try:
+            bak = self.backup_dir / self.settings_xml.name
+            if not bak.exists():
+                shutil.copy2(self.settings_xml, bak)
+        except Exception:
+            pass
+        try:
+            try:
+                tree = ET.parse(self.settings_xml)
+            except ET.ParseError:
+                self.settings_xml.write_text(self.DEFAULT_XML, encoding="utf-8")
+                tree = ET.parse(self.settings_xml)
+            root = tree.getroot()
+            props = None
+            for item in root.iter("Item"):
+                if item.attrib.get("class") == "UserGameSettings":
+                    props = item.find("Properties")
+                    break
+            if props is None:
+                item = ET.SubElement(root, "Item", {"class": "UserGameSettings", "referent": "RBX0"})
+                props = ET.SubElement(item, "Properties")
+            self._set_prop(props, "int", "SavedQualityLevel", str(self.ui_to_internal_quality(graphics_level)))
+            self._set_prop(props, "token", "ControlMode", "1" if shift_lock else "2")
+            self._set_prop(props, "float", "MasterVolume", str(round(max(0, min(100, volume)) / 100.0, 3)))
+            tree.write(self.settings_xml, encoding="utf-8", xml_declaration=False)
+            return True
+        except PermissionError:
+            if not quiet:
+                messagebox.showerror("Ошибка доступа", "Закройте Roblox перед применением настроек!")
+            return False
+        except Exception as e:
+            if not quiet:
+                messagebox.showerror("Ошибка XML", f"Не удалось изменить настройки:\n{e}")
+            return False
+
+    def restore_backup(self):
+        bak = self.backup_dir / self.settings_xml.name
+        if not bak.exists():
+            return False
+        try:
+            shutil.copy2(bak, self.settings_xml)
+            return True
+        except Exception:
+            return False
+
+    def apply_fast_flags(self, s, quiet=False):
+        ver = self.get_latest_version_dir()
+        if not ver:
+            return False
+        cs_dir = ver / "ClientSettings"
+        cs_file = cs_dir / "ClientAppSettings.json"
+        try:
+            cs_dir.mkdir(parents=True, exist_ok=True)
+            flags = {}
+            if cs_file.exists():
+                try:
+                    flags = json.loads(cs_file.read_text(encoding="utf-8"))
+                except Exception:
+                    flags = {}
+            for k in self.MANAGED_FLAGS:
+                flags.pop(k, None)
+            if int(s.get("fps", 0)) > 0:
+                flags["DFIntTaskSchedulerTargetFps"] = int(s["fps"])
+            if s.get("show_fps"):
+                flags["FFlagDebugDisplayFPS"] = True
+            if s.get("postfx_off"):
+                flags["FFlagDisablePostFx"] = True
+            pref = self.RENDER_FLAGS.get(s.get("rendering", "Авто"))
+            if pref:
+                for k in self.RENDER_FLAGS.values():
+                    flags[k] = (k == pref)
+            cs_file.write_text(json.dumps(flags, indent=4), encoding="utf-8")
+            return True
+        except Exception as e:
+            if not quiet:
+                messagebox.showerror("FastFlags", f"Не удалось записать флаги:\n{e}")
+            return False
+
+    def launch_menu(self):
+        ver = self.get_latest_version_dir()
+        if not ver:
+            messagebox.showerror("Ошибка", "Клиент Roblox не найден на ПК!")
+            return False
+        subprocess.Popen([str(ver / "RobloxPlayerBeta.exe")])
+        return True
+
+    def launch_place(self, place_id):
+        webbrowser.open(f"roblox://placeId={place_id}")
+        return True
+
+    @staticmethod
+    def parse_place_id(text):
+        text = (text or "").strip()
+        m = re.search(r"games/(\d+)", text) or re.search(r"placeId=(\d+)", text)
+        if m:
+            return m.group(1)
+        if text.isdigit():
+            return text
+        m = re.search(r"\d{4,}", text)
+        return m.group(0) if m else None
+
+    @staticmethod
+    def fetch_remote(place_id):
+        out = {"name": None, "icon": None}
+        hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        try:
+            req = urllib.request.Request(
+                f"https://apis.roblox.com/universes/v1/places/{place_id}/universe", headers=hdr)
+            uni = json.loads(urllib.request.urlopen(req, timeout=6).read().decode()).get("universeId")
+            if not uni:
+                return out
+            try:
+                req = urllib.request.Request(f"https://games.roblox.com/v1/games?universeIds={uni}", headers=hdr)
+                data = json.loads(urllib.request.urlopen(req, timeout=6).read().decode()).get("data", [])
+                if data:
+                    out["name"] = data[0].get("name")
+            except Exception:
+                pass
+            try:
+                req = urllib.request.Request(
+                    f"https://thumbnails.roblox.com/v1/games/icons?universeIds={uni}"
+                    f"&returnPolicy=PlaceHolder&size=150x150&format=Png&isCircular=false", headers=hdr)
+                data = json.loads(urllib.request.urlopen(req, timeout=6).read().decode()).get("data", [])
+                url = data[0].get("imageUrl") if data else None
+                if url:
+                    out["icon"] = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=8).read()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return out
+
+# =================================================================
+# ПРИЛОЖЕНИЕ
+# =================================================================
+SEED_GAMES = [
+    {"id": "2753915549", "name": "Blox Fruits"},
+    {"id": "4924922222", "name": "Brookhaven RP"},
+    {"id": "920587237",  "name": "Adopt Me!"},
+    {"id": "142823291",  "name": "Murder Mystery 2"},
+    {"id": "6516141723", "name": "DOORS"},
+    {"id": "286090429",  "name": "Arsenal"},
+]
+
+LAUNCHER_CURSORS = {
+    "Стандартный": "", "Стрелка": "arrow", "Прицел": "cross", "Рука": "hand2",
+    "Круг": "circle", "Точка": "dot", "Плюс": "plus", "Мишень": "target",
+}
+
+class LauncherApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.core = RobloxCore()
+        self.settings = {
+            "graphics": 5, "shiftlock": True, "fps": 120, "volume": 100,
+            "show_fps": False, "postfx_off": False, "rendering": "Авто",
+            "accent": "Синий", "apply_on_launch": True, "close_after": False,
+            "ui_font": "Segoe UI", "ui_scale": 1.0, "launcher_cursor": "Стандартный",
+        }
+        self.mods = {"font": None, "cursor": None, "sounds": {}, "version": None}
+        self.games = [dict(g) for g in SEED_GAMES]
+        self.profiles = []
+        self.history = []
+        self.load_config()
+        self.accent = ACCENTS.get(self.settings["accent"], ACCENTS["Синий"])
+        self.icons = {}
+        self.card_buttons = {}
+        self.cursor_buttons = {}
+        self.sound_status = {}
+        self._banner_after = None
+        self._grid_after = None
+        self._toast_after = None
+        self._undo = None
+        self._grid_width = 700
+        self._search = ""
+        self._prev_volume = self.settings["volume"] or 100
+        self.current_page = "play"
+        self._accent_sliders = []
+        self._accent_switches = []
+        self._accent_buttons = []
+
+        self.title("RBX Launcher — custom bootstrapper")
+        self.geometry("1120x760")
+        self.minsize(1000, 680)
+        self.configure(fg_color=BG)
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        setup_window_icon(self, self.core.data_dir)
+
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.build_sidebar()
+        self.build_pages()
+        self.build_toast()
+        self.apply_ui_font()
+        self.apply_launcher_cursor()
+        self.show_page("play")
+        self.load_icons()
+        self.after(150, self.regen_banner)
+        self.after(200, self.rebuild_games)
+        self.check_status()
+        self.after(600, self.check_mods_version)
+
+    # ---------------- конфигурация ----------------
+    def load_config(self):
+        try:
+            if self.core.config_file.exists():
+                data = json.loads(self.core.config_file.read_text(encoding="utf-8"))
+                self.settings.update(data.get("settings", {}))
+                if isinstance(data.get("games"), list) and data["games"]:
+                    self.games = [g for g in data["games"] if g.get("id")]
+                self.profiles = data.get("profiles", [])
+                self.history = data.get("history", [])
+                if isinstance(data.get("mods"), dict):
+                    self.mods.update(data["mods"])
+                    if not isinstance(self.mods.get("sounds"), dict):
+                        self.mods["sounds"] = {}
+        except Exception:
+            pass
+
+    def save_config(self):
+        try:
+            self.core.config_file.write_text(json.dumps(
+                {"settings": self.settings, "games": self.games, "profiles": self.profiles,
+                 "history": self.history, "mods": self.mods},
+                indent=4, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    # ---------------- сайдбар ----------------
+    def build_sidebar(self):
+        self.sidebar = ctk.CTkFrame(self, width=214, corner_radius=0, fg_color=SIDEBAR)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_propagate(False)
+
+        head = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        head.pack(fill="x", padx=16, pady=(20, 14))
+        self.logo_img = ctk.CTkImage(make_logo(self.accent), size=(42, 42))
+        self.logo_label = ctk.CTkLabel(head, image=self.logo_img, text="")
+        self.logo_label.pack(side="left")
+        tb = ctk.CTkFrame(head, fg_color="transparent")
+        tb.pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(tb, text="RBX Launcher", font=F(16, "bold"), text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(tb, text="custom bootstrapper", font=F(10), text_color=MUTED).pack(anchor="w")
+
+        ctk.CTkFrame(self.sidebar, height=1, fg_color=BORDER).pack(fill="x", padx=16, pady=(0, 12))
+
+        self.nav = {}
+        items = [("play", "▶   Играть"), ("sound", "🔊   Звук игры"), ("font", "Aa   Шрифт"),
+                 ("cursor", "➤   Курсор"), ("flags", "⚡   FastFlags"),
+                 ("settings", "⚙   Настройки"), ("about", "ℹ   О программе")]
+        for key, label in items:
+            b = ctk.CTkButton(self.sidebar, text=label, anchor="w", height=40, corner_radius=10,
+                              font=F(13, "bold"), fg_color="transparent", hover_color=CARD2,
+                              text_color=MUTED, command=lambda k=key: self.show_page(k))
+            b.pack(fill="x", padx=12, pady=2)
+            self.nav[key] = b
+
+        foot = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        foot.pack(side="bottom", fill="x", padx=16, pady=14)
+        ctk.CTkLabel(foot, text="v3.1 • иконка встроена", font=F(10), text_color=MUTED).pack(anchor="w")
+        ctk.CTkLabel(foot, text="моды звуков/шрифта/курсора\nс бэкапом и восстановлением",
+                     font=F(9), text_color=MUTED, justify="left").pack(anchor="w", pady=(4, 0))
+
+    def show_page(self, key):
+        self.current_page = key
+        for f in self.page_frames.values():
+            f.pack_forget()
+        self.page_frames[key].pack(fill="both", expand=True)
+        for k, b in self.nav.items():
+            if k == key:
+                b.configure(fg_color=mix(self.accent, BG, 0.82), text_color=TEXT)
+            else:
+                b.configure(fg_color="transparent", text_color=MUTED)
+        if key == "sound":
+            self.refresh_sound_rows()
+        elif key == "font":
+            self.refresh_font_status()
+        elif key == "cursor":
+            self.refresh_cursor_status()
+        elif key == "about":
+            self.refresh_history()
+        elif key == "play":
+            self.refresh_recent()
+            self.after(60, self.regen_banner)
+
+    # ---------------- каркас страниц ----------------
+    def build_pages(self):
+        wrap = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        wrap.grid(row=0, column=1, sticky="nsew")
+        self.page_frames = {}
+        for key in ("play", "sound", "font", "cursor", "flags", "settings", "about"):
+            self.page_frames[key] = ctk.CTkFrame(wrap, fg_color=BG, corner_radius=0)
+        self.build_play(self.page_frames["play"])
+        self.build_sound(self.page_frames["sound"])
+        self.build_font(self.page_frames["font"])
+        self.build_cursor(self.page_frames["cursor"])
+        self.build_flags(self.page_frames["flags"])
+        self.build_settings(self.page_frames["settings"])
+        self.build_about(self.page_frames["about"])
+
+    def scroll(self, parent):
+        s = ctk.CTkScrollableFrame(parent, fg_color=BG, corner_radius=0,
+                                   scrollbar_button_color=BORDER, scrollbar_button_hover_color=self.accent)
+        s.pack(fill="both", expand=True)
+        return s
+
+    def card(self, parent, title=None):
+        f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        f.pack(fill="x", padx=24, pady=(0, 14))
+        if title:
+            ctk.CTkLabel(f, text=title, font=F(12, "bold"), text_color=MUTED).pack(anchor="w", padx=18, pady=(14, 0))
+        return f
+
+    def page_head(self, p, title, sub):
+        ctk.CTkLabel(p, text=title, font=F(24, "bold"), text_color=TEXT).pack(anchor="w", padx=24, pady=(24, 4))
+        ctk.CTkLabel(p, text=sub, font=F(12), text_color=MUTED).pack(anchor="w", padx=24, pady=(0, 16))
+
+    def acc_btn(self, master, **kw):
+        b = ctk.CTkButton(master, fg_color=self.accent, hover_color=mix(self.accent, "#FFFFFF", 0.18), **kw)
+        self._accent_buttons.append(b)
+        return b
+
+    # ---------------- ИГРАТЬ ----------------
+    def build_play(self, container):
+        bar = ctk.CTkFrame(container, fg_color=SIDEBAR, corner_radius=0, height=84)
+        bar.pack(side="bottom", fill="x")
+        bar.pack_propagate(False)
+        inner = ctk.CTkFrame(bar, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=20, pady=16)
+        self.entry_place = ctk.CTkEntry(inner, height=48, corner_radius=12, font=F(13),
+                                        placeholder_text="Place ID или ссылка на игру…",
+                                        fg_color=CARD2, border_color=BORDER, text_color=TEXT)
+        self.entry_place.pack(side="left", fill="x", expand=True)
+        self.entry_place.bind("<Return>", lambda e: self.on_play())
+        self.btn_add = self.acc_btn(inner, text="＋ В библиотеку", width=140, height=48,
+                                    corner_radius=12, font=F(13, "bold"), command=self.on_add)
+        self.btn_add.pack(side="left", padx=(10, 0))
+        ctk.CTkButton(inner, text="Меню Roblox", width=110, height=48, corner_radius=12, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=self.on_menu).pack(side="left", padx=(10, 0))
+        self.btn_play = ctk.CTkButton(inner, text="▶  ИГРАТЬ", width=190, height=52, corner_radius=12,
+                                      font=F(17, "bold"), fg_color=GREEN, hover_color=GREEN_H,
+                                      text_color="#FFFFFF", command=self.on_play)
+        self.btn_play.pack(side="left", padx=(12, 0))
+
+        p = self.scroll(container)
+        self.banner = ctk.CTkFrame(p, height=150, fg_color=CARD, corner_radius=16)
+        self.banner.pack(fill="x", padx=24, pady=(22, 16))
+        self.banner.pack_propagate(False)
+        self.banner_img_label = ctk.CTkLabel(self.banner, text="")
+        self.banner_img_label.place(x=0, y=0)
+        ctk.CTkLabel(self.banner, text="ROBLOX LAUNCHER", font=F(27, "bold"),
+                     text_color="#FFFFFF").place(x=26, y=32)
+        ctk.CTkLabel(self.banner, text="Графика, звук, шрифт, курсор и мгновенный запуск любимых игр",
+                     font=F(13), text_color="#D9E2F5").place(x=26, y=76)
+        ctk.CTkLabel(self.banner, text="CUSTOM BOOTSTRAPPER", font=F(10, "bold"),
+                     text_color="#FFFFFF").place(relx=1.0, x=-20, y=16, anchor="ne")
+        self.banner.bind("<Configure>", lambda e: self.schedule_banner())
+
+        row = ctk.CTkFrame(p, fg_color="transparent")
+        row.pack(fill="x", padx=24, pady=(0, 14))
+        self.status_chip = ctk.CTkLabel(row, text="●  Поиск клиента…", font=F(12, "bold"),
+                                        text_color=MUTED, fg_color=CARD, corner_radius=10, height=30)
+        self.status_chip.pack(side="left", ipadx=12)
+        ctk.CTkButton(row, text="Обновить", width=90, height=30, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=self.check_status).pack(side="right")
+
+        q = self.card(p, "БЫСТРЫЕ НАСТРОЙКИ")
+        qi = ctk.CTkFrame(q, fg_color="transparent")
+        qi.pack(fill="x", padx=18, pady=(10, 16))
+        left = ctk.CTkFrame(qi, fg_color="transparent")
+        left.pack(side="left", fill="x", expand=True)
+        self.lbl_gfx = ctk.CTkLabel(left, text=f"Уровень графики: {self.settings['graphics']} / 10",
+                                    font=F(13), text_color=TEXT)
+        self.lbl_gfx.pack(anchor="w")
+        self.slider_gfx = ctk.CTkSlider(left, from_=1, to=10, number_of_steps=9, height=18,
+                                        progress_color=self.accent, button_color=self.accent,
+                                        button_hover_color=mix(self.accent, "#FFFFFF", 0.25),
+                                        fg_color=CARD2, command=self.on_gfx)
+        self.slider_gfx.set(self.settings["graphics"])
+        self.slider_gfx.pack(fill="x", pady=(8, 0))
+        self._accent_sliders.append(self.slider_gfx)
+        self.var_shift = BooleanVar(value=self.settings["shiftlock"])
+        self.sw_shift = ctk.CTkSwitch(qi, text="Shift Lock", font=F(13), text_color=TEXT,
+                                      variable=self.var_shift, progress_color=self.accent,
+                                      fg_color=CARD2, button_color="#FFFFFF", command=self.on_shift)
+        self.sw_shift.pack(side="right", padx=(24, 0))
+        self._accent_switches.append(self.sw_shift)
+
+        pr = ctk.CTkFrame(p, fg_color="transparent")
+        pr.pack(fill="x", padx=24, pady=(0, 14))
+        ctk.CTkLabel(pr, text="Пресеты:", font=F(12, "bold"), text_color=MUTED).pack(side="left")
+        for label, gfx, fps, post in (("⚡ Производительность", 1, 240, True),
+                                      ("⚖ Баланс", 5, 120, False),
+                                      ("💎 Качество", 10, 60, False)):
+            ctk.CTkButton(pr, text=label, height=32, corner_radius=10, font=F(12),
+                          fg_color=CARD, hover_color=CARD2, text_color=TEXT,
+                          border_width=1, border_color=BORDER,
+                          command=lambda g=gfx, f=fps, po=post: self.apply_preset(g, f, po)
+                          ).pack(side="left", padx=(10, 0))
+
+        hr = ctk.CTkFrame(p, fg_color="transparent")
+        hr.pack(fill="x", padx=24, pady=(6, 10))
+        ctk.CTkLabel(hr, text="Мои игры", font=F(17, "bold"), text_color=TEXT).pack(side="left")
+        self.lbl_count = ctk.CTkLabel(hr, text="", font=F(12), text_color=MUTED)
+        self.lbl_count.pack(side="left", padx=(10, 0))
+        self.entry_search = ctk.CTkEntry(hr, width=200, height=32, corner_radius=10, font=F(12),
+                                         placeholder_text="Поиск по играм…", fg_color=CARD,
+                                         border_color=BORDER, text_color=TEXT)
+        self.entry_search.pack(side="right")
+        self.entry_search.bind("<KeyRelease>", lambda e: self.on_search())
+        ctk.CTkLabel(p, text="Клик по карточке — игра запускается сразу. ✕ удаляет (с кнопкой «Вернуть»).",
+                     font=F(11), text_color=MUTED).pack(anchor="w", padx=26, pady=(0, 10))
+        self.games_grid = ctk.CTkFrame(p, fg_color="transparent")
+        self.games_grid.pack(fill="x", padx=24, pady=(0, 18))
+        self.games_grid.bind("<Configure>", lambda e: self.schedule_grid(e.width))
+
+        ctk.CTkLabel(p, text="Недавние запуски", font=F(14, "bold"), text_color=TEXT).pack(anchor="w", padx=26, pady=(0, 8))
+        self.recent_frame = ctk.CTkFrame(p, fg_color="transparent")
+        self.recent_frame.pack(fill="x", padx=24, pady=(0, 24))
+
+    # ---------------- ЗВУК ----------------
+    def build_sound(self, container):
+        p = self.scroll(container)
+        self.page_head(p, "Звук игры", "Громкость клиента и замена звуковых файлов Roblox (оригиналы в бэкапе).")
+        c = self.card(p, "ГРОМКОСТЬ")
+        ci = ctk.CTkFrame(c, fg_color="transparent")
+        ci.pack(fill="x", padx=18, pady=(12, 16))
+        self.lbl_vol = ctk.CTkLabel(ci, text=f"Общая громкость: {self.settings['volume']}%",
+                                    font=F(13), text_color=TEXT)
+        self.lbl_vol.pack(anchor="w")
+        self.slider_vol = ctk.CTkSlider(ci, from_=0, to=100, number_of_steps=100, height=18,
+                                        progress_color=self.accent, button_color=self.accent,
+                                        button_hover_color=mix(self.accent, "#FFFFFF", 0.25),
+                                        fg_color=CARD2, command=self.on_volume)
+        self.slider_vol.set(self.settings["volume"])
+        self.slider_vol.pack(fill="x", pady=(8, 0))
+        self._accent_sliders.append(self.slider_vol)
+        self.var_mute = BooleanVar(value=self.settings["volume"] == 0)
+        ctk.CTkSwitch(ci, text="Полностью отключить звук", font=F(13), text_color=TEXT,
+                      variable=self.var_mute, progress_color=RED, fg_color=CARD2,
+                      command=self.on_mute).pack(anchor="w", pady=(12, 0))
+        ctk.CTkLabel(c, text="Громкость записывается в GlobalBasicSettings_13.xml при запуске.",
+                     font=F(11), text_color=MUTED).pack(anchor="w", padx=18, pady=(0, 14))
+
+        c2 = self.card(p, "ЗАМЕНА ЗВУКОВ КЛИЕНТА")
+        ctk.CTkLabel(c2, text="Выберите свой .wav / .mp3 для любого звука игры (прыжок, шаги, удары и т.д.).",
+                     font=F(11), text_color=MUTED).pack(anchor="w", padx=18, pady=(8, 8))
+        self.sound_rows = ctk.CTkFrame(c2, fg_color="transparent")
+        self.sound_rows.pack(fill="x", padx=14, pady=(0, 8))
+        br = ctk.CTkFrame(c2, fg_color="transparent")
+        br.pack(fill="x", padx=18, pady=(0, 16))
+        ctk.CTkButton(br, text="Восстановить все звуки", height=36, corner_radius=10, font=F(12, "bold"),
+                      fg_color=CARD2, hover_color=RED, text_color=TEXT,
+                      command=lambda: self.restore_cat("sounds")).pack(side="left")
+        ctk.CTkButton(br, text="Открыть папку звуков", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=lambda: self.open_path(self.core.sounds_dir())).pack(side="left", padx=(10, 0))
+
+    def refresh_sound_rows(self):
+        for w in self.sound_rows.winfo_children():
+            w.destroy()
+        self.sound_status.clear()
+        files = self.core.list_sounds()
+        if not files:
+            ctk.CTkLabel(self.sound_rows, text="Звуковые файлы клиента не найдены.",
+                         font=F(12), text_color=MUTED).pack(anchor="w", padx=6, pady=8)
+            return
+        for f in files[:14]:
+            row = ctk.CTkFrame(self.sound_rows, fg_color=CARD2, corner_radius=10)
+            row.pack(fill="x", padx=4, pady=3)
+            ctk.CTkLabel(row, text=f.name, font=F(12), text_color=TEXT, width=240,
+                         anchor="w").pack(side="left", padx=(12, 6), pady=8)
+            st = ctk.CTkLabel(row, text="", font=F(11), text_color=MUTED)
+            st.pack(side="left", padx=(0, 8))
+            self.sound_status[f.name] = st
+            ctk.CTkButton(row, text="Сброс", width=64, height=28, corner_radius=8, font=F(11),
+                          fg_color=CARD, hover_color=RED, text_color=MUTED,
+                          command=lambda n=f.name: self.restore_one("sounds", n)
+                          ).pack(side="right", padx=(0, 10), pady=6)
+            ctk.CTkButton(row, text="Заменить…", width=92, height=28, corner_radius=8, font=F(11, "bold"),
+                          fg_color=self.accent, hover_color=mix(self.accent, "#FFFFFF", 0.18),
+                          command=lambda n=f.name: self.replace_sound(n)
+                          ).pack(side="right", padx=(0, 6), pady=6)
+        if len(files) > 14:
+            ctk.CTkLabel(self.sound_rows, text=f"…и ещё {len(files) - 14} файлов в папке клиента.",
+                         font=F(11), text_color=MUTED).pack(anchor="w", padx=6, pady=(4, 8))
+        self.refresh_mod_labels("sounds")
+
+    def replace_sound(self, name):
+        path = filedialog.askopenfilename(title="Выберите звук",
+                                          filetypes=[("Аудио", "*.wav *.mp3 *.ogg"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        base = self.core.sounds_dir()
+        if not base:
+            self.toast("Клиент Roblox не найден", "err")
+            return
+        try:
+            self.core.replace_client_file("sounds", base / name, Path(path).read_bytes())
+            self.mods["sounds"][name] = path
+            self.mark_mods_version()
+            self.toast(f"Звук заменён: {name}", "ok")
+        except Exception as e:
+            self.toast(f"Ошибка замены: {e}", "err")
+        self.refresh_mod_labels("sounds")
+
+    # ---------------- ШРИФТ ----------------
+    def build_font(self, container):
+        p = self.scroll(container)
+        self.page_head(p, "Шрифт", "Шрифт интерфейса лаунчера (сразу) и шрифт самой игры Roblox.")
+        c = self.card(p, "ШРИФТ ЛАУНЧЕРА")
+        ci = ctk.CTkFrame(c, fg_color="transparent")
+        ci.pack(fill="x", padx=18, pady=(12, 10))
+        ctk.CTkLabel(ci, text="Семейство:", font=F(13), text_color=TEXT).pack(side="left")
+        self.entry_font = ctk.CTkEntry(ci, width=220, height=36, corner_radius=10, font=F(13),
+                                       fg_color=CARD2, border_color=BORDER, text_color=TEXT)
+        self.entry_font.insert(0, self.settings["ui_font"])
+        self.entry_font.pack(side="left", padx=(10, 0))
+        self.entry_font.bind("<Return>", lambda e: self.apply_ui_font_from_entry())
+        self.acc_btn(ci, text="Применить", width=100, height=36, corner_radius=10, font=F(12, "bold"),
+                     command=self.apply_ui_font_from_entry).pack(side="left", padx=(10, 0))
+        pr = ctk.CTkFrame(c, fg_color="transparent")
+        pr.pack(fill="x", padx=18, pady=(0, 10))
+        for fam in ("Segoe UI", "Arial", "Verdana", "Tahoma", "Consolas", "Georgia",
+                    "Trebuchet MS", "Comic Sans MS"):
+            ctk.CTkButton(pr, text=fam, height=28, corner_radius=8, font=F(11),
+                          fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                          command=lambda f=fam: self.set_ui_font(f)).pack(side="left", padx=(0, 6), pady=2)
+        sr = ctk.CTkFrame(c, fg_color="transparent")
+        sr.pack(fill="x", padx=18, pady=(0, 10))
+        self.lbl_scale = ctk.CTkLabel(sr, text=f"Масштаб текста: {int(round(self.settings['ui_scale'] * 100))}%",
+                                      font=F(12), text_color=TEXT)
+        self.lbl_scale.pack(anchor="w")
+        self.slider_scale = ctk.CTkSlider(sr, from_=0.8, to=1.3, number_of_steps=10, height=16,
+                                          progress_color=self.accent, button_color=self.accent,
+                                          button_hover_color=mix(self.accent, "#FFFFFF", 0.25),
+                                          fg_color=CARD2, command=self.on_scale)
+        self.slider_scale.set(self.settings["ui_scale"])
+        self.slider_scale.pack(fill="x", pady=(6, 0))
+        self._accent_sliders.append(self.slider_scale)
+        ctk.CTkLabel(c, text="Съешь же ещё этих мягких французских булок, да выпей чаю. 0123456789",
+                     font=F(15, "bold"), text_color=TEXT).pack(anchor="w", padx=18, pady=(4, 16))
+
+        c2 = self.card(p, "ШРИФТ ИГРЫ ROBLOX")
+        self.lbl_font_targets = ctk.CTkLabel(c2, text="", font=F(11), text_color=MUTED,
+                                             wraplength=660, justify="left")
+        self.lbl_font_targets.pack(anchor="w", padx=18, pady=(10, 8))
+        self.lbl_font_status = ctk.CTkLabel(c2, text="", font=F(12), text_color=MUTED)
+        self.lbl_font_status.pack(anchor="w", padx=18, pady=(0, 8))
+        br = ctk.CTkFrame(c2, fg_color="transparent")
+        br.pack(fill="x", padx=18, pady=(0, 16))
+        self.acc_btn(br, text="Выбрать файл шрифта (.ttf / .otf)…", height=36, corner_radius=10,
+                     font=F(12, "bold"), command=self.replace_game_font).pack(side="left")
+        ctk.CTkButton(br, text="Восстановить шрифты Roblox", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=RED, text_color=TEXT,
+                      command=lambda: self.restore_cat("fonts")).pack(side="left", padx=(10, 0))
+
+    def apply_ui_font_from_entry(self):
+        fam = self.entry_font.get().strip()
+        if fam not in tkfont.families():
+            self.toast(f"Шрифт «{fam}» не установлен в системе", "err")
+            return
+        self.set_ui_font(fam)
+
+    def set_ui_font(self, fam):
+        self.settings["ui_font"] = fam
+        self.entry_font.delete(0, "end")
+        self.entry_font.insert(0, fam)
+        self.save_config()
+        self.apply_ui_font()
+        self.toast(f"Шрифт лаунчера: {fam}", "ok")
+
+    def apply_ui_font(self):
+        fam = self.settings["ui_font"]
+        scale = float(self.settings["ui_scale"])
+        for f, base in _FONTS:
+            try:
+                f.configure(family=fam, size=max(9, int(round(base * scale))))
+            except Exception:
+                pass
+
+    def on_scale(self, v):
+        self.settings["ui_scale"] = round(float(v), 2)
+        self.lbl_scale.configure(text=f"Масштаб текста: {int(round(float(v) * 100))}%")
+        self.save_config()
+        self.apply_ui_font()
+
+    def replace_game_font(self):
+        path = filedialog.askopenfilename(title="Выберите шрифт",
+                                          filetypes=[("Шрифты", "*.ttf *.otf"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        targets = self.core.list_fonts()
+        if not targets:
+            self.toast("Шрифты клиента не найдены", "err")
+            return
+        data = Path(path).read_bytes()
+        n = 0
+        for t in targets:
+            try:
+                self.core.replace_client_file("fonts", t, data)
+                n += 1
+            except Exception:
+                pass
+        self.mods["font"] = path
+        self.mark_mods_version()
+        self.toast(f"Шрифт игры заменён ({n} файлов): {Path(path).name}", "ok")
+        self.refresh_font_status()
+
+    def refresh_font_status(self):
+        targets = self.core.list_fonts()
+        self.lbl_font_targets.configure(text="Файлы клиента: " +
+                                        (", ".join(t.name for t in targets) if targets else "не найдены"))
+        mod = [t.name for t in targets if self.core.is_modified("fonts", t.name)]
+        self.lbl_font_status.configure(
+            text=f"Изменено файлов: {len(mod)}" if mod else "Используются оригинальные шрифты Roblox.",
+            text_color=AMBER if mod else MUTED)
+
+    # ---------------- КУРСОР ----------------
+    def build_cursor(self, container):
+        p = self.scroll(container)
+        self.page_head(p, "Курсор", "Курсор мыши внутри игры Roblox и курсор окна лаунчера.")
+        c = self.card(p, "КУРСОР ИГРЫ — ПРЕСЕТЫ")
+        grid = ctk.CTkFrame(c, fg_color="transparent")
+        grid.pack(fill="x", padx=18, pady=(12, 10))
+        for i, (kind, label) in enumerate(CURSOR_PRESETS):
+            img = ctk.CTkImage(make_cursor(kind, 48, self.accent), size=(48, 48))
+            b = ctk.CTkButton(grid, text=label, image=img, compound="top", width=104, height=104,
+                              corner_radius=12, font=F(12, "bold"), fg_color=CARD2, hover_color=BORDER,
+                              border_width=1, border_color=BORDER, text_color=TEXT,
+                              command=lambda k=kind: self.apply_cursor_preset(k))
+            b.grid(row=i // 6, column=i % 6, padx=5, pady=5)
+            self.cursor_buttons[kind] = b
+        self.lbl_cursor_status = ctk.CTkLabel(c, text="", font=F(12), text_color=MUTED)
+        self.lbl_cursor_status.pack(anchor="w", padx=18, pady=(0, 8))
+        br = ctk.CTkFrame(c, fg_color="transparent")
+        br.pack(fill="x", padx=18, pady=(0, 16))
+        self.acc_btn(br, text="Свой курсор (.png)…", height=36, corner_radius=10, font=F(12, "bold"),
+                     command=self.replace_custom_cursor).pack(side="left")
+        ctk.CTkButton(br, text="Восстановить курсоры Roblox", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=RED, text_color=TEXT,
+                      command=lambda: self.restore_cat("cursors")).pack(side="left", padx=(10, 0))
+
+        c2 = self.card(p, "КУРСОР ОКНА ЛАУНЧЕРА")
+        r2 = ctk.CTkFrame(c2, fg_color="transparent")
+        r2.pack(fill="x", padx=18, pady=(12, 16))
+        ctk.CTkLabel(r2, text="Стиль:", font=F(13), text_color=TEXT).pack(side="left")
+        self.opt_lcursor = ctk.CTkOptionMenu(r2, values=list(LAUNCHER_CURSORS.keys()), width=180, height=34,
+                                             corner_radius=10, font=F(12), fg_color=CARD2,
+                                             button_color=BORDER, button_hover_color=self.accent,
+                                             dropdown_fg_color=CARD2, dropdown_hover_color=BORDER,
+                                             text_color=TEXT, command=self.on_launcher_cursor)
+        self.opt_lcursor.set(self.settings["launcher_cursor"])
+        self.opt_lcursor.pack(side="left", padx=(10, 0))
+
+    def _cursor_targets(self):
+        files = self.core.list_cursors()
+        picked = [f for f in files if f.name in ("ArrowCursor.png", "ArrowFarCursor.png")]
+        return picked or files[:2]
+
+    def apply_cursor_preset(self, kind):
+        targets = self._cursor_targets()
+        if not targets:
+            self.toast("Курсоры клиента не найдены", "err")
+            return
+        n = 0
+        for t in targets:
+            try:
+                with Image.open(t) as im:
+                    size = im.size[0]
+                buf = io.BytesIO()
+                make_cursor(kind, size, self.accent).save(buf, "PNG")
+                self.core.replace_client_file("cursors", t, buf.getvalue())
+                n += 1
+            except Exception:
+                pass
+        self.mods["cursor"] = {"kind": kind, "path": None}
+        self.mark_mods_version()
+        self.toast(f"Курсор игры: {dict(CURSOR_PRESETS).get(kind, kind)} ({n} файлов)", "ok")
+        self.refresh_cursor_status()
+
+    def replace_custom_cursor(self):
+        path = filedialog.askopenfilename(title="Выберите курсор",
+                                          filetypes=[("PNG", "*.png"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            src = Image.open(path).convert("RGBA")
+        except Exception:
+            self.toast("Не удалось открыть PNG", "err")
+            return
+        targets = self._cursor_targets()
+        n = 0
+        for t in targets:
+            try:
+                with Image.open(t) as im:
+                    size = im.size
+                buf = io.BytesIO()
+                src.resize(size, Image.LANCZOS).save(buf, "PNG")
+                self.core.replace_client_file("cursors", t, buf.getvalue())
+                n += 1
+            except Exception:
+                pass
+        self.mods["cursor"] = {"kind": None, "path": path}
+        self.mark_mods_version()
+        self.toast(f"Свой курсор применён ({n} файлов)", "ok")
+        self.refresh_cursor_status()
+
+    def refresh_cursor_status(self):
+        targets = self.core.list_cursors()
+        mod = [t.name for t in targets if self.core.is_modified("cursors", t.name)]
+        self.lbl_cursor_status.configure(
+            text=f"Изменено файлов: {len(mod)} ({', '.join(mod)})" if mod
+            else "Используются оригинальные курсоры Roblox.",
+            text_color=AMBER if mod else MUTED)
+
+    def on_launcher_cursor(self, value):
+        self.settings["launcher_cursor"] = value
+        self.save_config()
+        self.apply_launcher_cursor()
+
+    def apply_launcher_cursor(self):
+        cur = LAUNCHER_CURSORS.get(self.settings["launcher_cursor"], "")
+        try:
+            self.configure(cursor=cur or "arrow")
+        except Exception:
+            pass
+
+    # ---------------- FASTFLAGS ----------------
+    def build_flags(self, container):
+        p = self.scroll(container)
+        self.page_head(p, "FastFlags", "Записываются в ClientAppSettings.json и действуют при следующем запуске.")
+        c = self.card(p, "ЛИМИТ FPS")
+        r = ctk.CTkFrame(c, fg_color="transparent")
+        r.pack(fill="x", padx=18, pady=(10, 10))
+        self.entry_fps = ctk.CTkEntry(r, width=90, height=38, corner_radius=10, font=F(14),
+                                      fg_color=CARD2, border_color=BORDER, text_color=TEXT)
+        self.entry_fps.insert(0, str(self.settings["fps"]))
+        self.entry_fps.pack(side="left")
+        self.entry_fps.bind("<Return>", lambda e: self.commit_fps())
+        self.entry_fps.bind("<FocusOut>", lambda e: self.commit_fps())
+        for v in (60, 120, 144, 240, 0):
+            ctk.CTkButton(r, text=str(v) if v else "Стандарт", width=70, height=38, corner_radius=10,
+                          font=F(12), fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                          command=lambda x=v: self.set_fps(x)).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(c, text="0 = стандартный лимит Roblox (60 FPS).", font=F(11),
+                     text_color=MUTED).pack(anchor="w", padx=18, pady=(0, 14))
+
+        c2 = self.card(p, "ГРАФИКА И РЕНДЕРИНГ")
+        self.var_showfps = BooleanVar(value=self.settings["show_fps"])
+        sw1 = ctk.CTkSwitch(c2, text="Показывать счётчик FPS в игре", font=F(13), text_color=TEXT,
+                            variable=self.var_showfps, progress_color=self.accent, fg_color=CARD2,
+                            command=lambda: self.set_flag("show_fps", self.var_showfps.get()))
+        sw1.pack(anchor="w", padx=18, pady=(12, 6))
+        self._accent_switches.append(sw1)
+        self.var_postfx = BooleanVar(value=self.settings["postfx_off"])
+        sw2 = ctk.CTkSwitch(c2, text="Отключить пост-обработку (больше FPS)", font=F(13), text_color=TEXT,
+                            variable=self.var_postfx, progress_color=self.accent, fg_color=CARD2,
+                            command=lambda: self.set_flag("postfx_off", self.var_postfx.get()))
+        sw2.pack(anchor="w", padx=18, pady=6)
+        self._accent_switches.append(sw2)
+        rr = ctk.CTkFrame(c2, fg_color="transparent")
+        rr.pack(fill="x", padx=18, pady=(6, 16))
+        ctk.CTkLabel(rr, text="Предпочтительный рендер:", font=F(13), text_color=TEXT).pack(side="left")
+        self.opt_render = ctk.CTkOptionMenu(rr, values=["Авто", "Direct3D 11", "Vulkan", "OpenGL"],
+                                            width=160, height=34, corner_radius=10, font=F(12),
+                                            fg_color=CARD2, button_color=BORDER,
+                                            button_hover_color=self.accent, dropdown_fg_color=CARD2,
+                                            dropdown_hover_color=BORDER, text_color=TEXT,
+                                            command=lambda v: self.set_flag("rendering", v))
+        self.opt_render.set(self.settings["rendering"])
+        self.opt_render.pack(side="right")
+
+        c3 = self.card(p, "ФАЙЛ ФЛАГОВ")
+        self.lbl_flags_path = ctk.CTkLabel(c3, text="", font=F(11), text_color=MUTED,
+                                           wraplength=660, justify="left")
+        self.lbl_flags_path.pack(anchor="w", padx=18, pady=(10, 8))
+        br = ctk.CTkFrame(c3, fg_color="transparent")
+        br.pack(fill="x", padx=18, pady=(0, 16))
+        self.acc_btn(br, text="Применить сейчас", height=36, corner_radius=10, font=F(12, "bold"),
+                     command=self.apply_flags_now).pack(side="left")
+        ctk.CTkButton(br, text="Открыть ClientSettings", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=self.open_clientsettings).pack(side="left", padx=(10, 0))
+
+    # ---------------- НАСТРОЙКИ ----------------
+    def build_settings(self, container):
+        p = self.scroll(container)
+        self.page_head(p, "Настройки", "Внешний вид, поведение лаунчера, профили и обслуживание модов.")
+        c = self.card(p, "ЦВЕТ АКЦЕНТА")
+        r = ctk.CTkFrame(c, fg_color="transparent")
+        r.pack(fill="x", padx=18, pady=(12, 16))
+        self.swatches = {}
+        for name, col in ACCENTS.items():
+            b = ctk.CTkButton(r, text="", width=40, height=40, corner_radius=20, fg_color=col,
+                              hover_color=mix(col, "#FFFFFF", 0.2), border_width=3,
+                              border_color=TEXT if name == self.settings["accent"] else CARD,
+                              command=lambda n=name: self.set_accent(n))
+            b.pack(side="left", padx=(0, 12))
+            self.swatches[name] = b
+
+        c2 = self.card(p, "ПОВЕДЕНИЕ")
+        self.var_apply = BooleanVar(value=self.settings["apply_on_launch"])
+        swa = ctk.CTkSwitch(c2, text="Применять настройки графики и звука перед каждым запуском",
+                            font=F(13), text_color=TEXT, variable=self.var_apply,
+                            progress_color=self.accent, fg_color=CARD2,
+                            command=lambda: self.set_flag("apply_on_launch", self.var_apply.get()))
+        swa.pack(anchor="w", padx=18, pady=(12, 6))
+        self._accent_switches.append(swa)
+        self.var_close = BooleanVar(value=self.settings["close_after"])
+        swc = ctk.CTkSwitch(c2, text="Закрывать лаунчер после запуска игры", font=F(13), text_color=TEXT,
+                            variable=self.var_close, progress_color=self.accent, fg_color=CARD2,
+                            command=lambda: self.set_flag("close_after", self.var_close.get()))
+        swc.pack(anchor="w", padx=18, pady=(6, 16))
+        self._accent_switches.append(swc)
+
+        c3 = self.card(p, "ПРОФИЛИ НАСТРОЕК")
+        pr = ctk.CTkFrame(c3, fg_color="transparent")
+        pr.pack(fill="x", padx=18, pady=(12, 8))
+        self.entry_profile = ctk.CTkEntry(pr, height=36, corner_radius=10, font=F(12),
+                                          placeholder_text="Имя профиля, например «Для PvP»",
+                                          fg_color=CARD2, border_color=BORDER, text_color=TEXT)
+        self.entry_profile.pack(side="left", fill="x", expand=True)
+        self.acc_btn(pr, text="Сохранить текущий", width=150, height=36, corner_radius=10,
+                     font=F(12, "bold"), command=self.save_profile).pack(side="left", padx=(10, 0))
+        self.profile_rows = ctk.CTkFrame(c3, fg_color="transparent")
+        self.profile_rows.pack(fill="x", padx=14, pady=(0, 14))
+        self.refresh_profiles()
+
+        c4 = self.card(p, "МОДЫ И ОБСЛУЖИВАНИЕ")
+        ctk.CTkLabel(c4, text="После обновления Roblox создаётся новая папка версии — моды нужно поставить заново.",
+                     font=F(11), text_color=MUTED).pack(anchor="w", padx=18, pady=(8, 8))
+        r4 = ctk.CTkFrame(c4, fg_color="transparent")
+        r4.pack(fill="x", padx=18, pady=(0, 8))
+        self.acc_btn(r4, text="Переустановить мои моды", height=36, corner_radius=10, font=F(12, "bold"),
+                     command=self.reapply_mods).pack(side="left")
+        ctk.CTkButton(r4, text="Сбросить все моды", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=RED, text_color=TEXT,
+                      command=self.reset_all_mods).pack(side="left", padx=(10, 0))
+        ctk.CTkButton(r4, text="Пересоздать иконку", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=self.regen_icon).pack(side="left", padx=(10, 0))
+
+        c5 = self.card(p, "ДАННЫЕ")
+        r5 = ctk.CTkFrame(c5, fg_color="transparent")
+        r5.pack(fill="x", padx=18, pady=(12, 8))
+        ctk.CTkButton(r5, text="Восстановить настройки Roblox", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=self.on_restore).pack(side="left")
+        ctk.CTkButton(r5, text="Очистить логи Roblox", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=AMBER, text_color=TEXT,
+                      command=self.clear_logs).pack(side="left", padx=(10, 0))
+        r6 = ctk.CTkFrame(c5, fg_color="transparent")
+        r6.pack(fill="x", padx=18, pady=(0, 16))
+        ctk.CTkButton(r6, text="Экспорт настроек…", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=self.export_config).pack(side="left")
+        ctk.CTkButton(r6, text="Импорт настроек…", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=self.import_config).pack(side="left", padx=(10, 0))
+        ctk.CTkButton(r6, text="Папка лаунчера", height=36, corner_radius=10, font=F(12),
+                      fg_color=CARD2, hover_color=BORDER, text_color=TEXT,
+                      command=lambda: self.open_path(self.core.base_dir)).pack(side="left", padx=(10, 0))
+
+    def regen_icon(self):
+        try:
+            ico = export_icon(self.core.data_dir)
+            setup_window_icon(self, self.core.data_dir)
+            self.toast(f"Иконка пересоздана: {ico}", "ok")
+        except Exception as e:
+            self.toast(f"Не удалось создать иконку: {e}", "err")
+
+    def mark_mods_version(self):
+        v = self.core.get_latest_version_dir()
+        self.mods["version"] = v.name if v else None
+        self.save_config()
+
+    def check_mods_version(self):
+        v = self.core.get_latest_version_dir()
+        if not v or not self.mods.get("version"):
+            return
+        has = self.mods.get("font") or self.mods.get("cursor") or self.mods.get("sounds")
+        if has and v.name != self.mods["version"]:
+            self.toast("Roblox обновился — нажмите «Переустановить мои моды» в Настройках", "warn")
+
+    def reapply_mods(self):
+        n = 0
+        fp = self.mods.get("font")
+        if fp and Path(fp).exists():
+            data = Path(fp).read_bytes()
+            for t in self.core.list_fonts():
+                try:
+                    self.core.replace_client_file("fonts", t, data)
+                    n += 1
+                except Exception:
+                    pass
+        cur = self.mods.get("cursor") or {}
+        targets = self._cursor_targets()
+        if cur.get("kind"):
+            for t in targets:
+                try:
+                    with Image.open(t) as im:
+                        size = im.size[0]
+                    buf = io.BytesIO()
+                    make_cursor(cur["kind"], size, self.accent).save(buf, "PNG")
+                    self.core.replace_client_file("cursors", t, buf.getvalue())
+                    n += 1
+                except Exception:
+                    pass
+        elif cur.get("path") and Path(cur["path"]).exists():
+            try:
+                src = Image.open(cur["path"]).convert("RGBA")
+                for t in targets:
+                    with Image.open(t) as im:
+                        size = im.size
+                    buf = io.BytesIO()
+                    src.resize(size, Image.LANCZOS).save(buf, "PNG")
+                    self.core.replace_client_file("cursors", t, buf.getvalue())
+                    n += 1
+            except Exception:
+                pass
+        base = self.core.sounds_dir()
+        if base:
+            for name, path in (self.mods.get("sounds") or {}).items():
+                if Path(path).exists() and (base / name).exists():
+                    try:
+                        self.core.replace_client_file("sounds", base / name, Path(path).read_bytes())
+                        n += 1
+                    except Exception:
+                        pass
+        self.mark_mods_version()
+        self.toast(f"Моды переустановлены: {n} файлов" if n else "Нет сохранённых модов для установки",
+                     "ok" if n else "warn")
+
+    def reset_all_mods(self):
+        total = sum(self.core.restore_category(c) for c in ("sounds", "fonts", "cursors"))
+        self.mods = {"font": None, "cursor": None, "sounds": {}, "version": None}
+        self.save_config()
+        self.toast(f"Все моды сняты, оригиналы возвращены ({total} файлов)", "ok")
+
+    def save_profile(self):
+        name = self.entry_profile.get().strip()
+        if not name:
+            self.toast("Введите имя профиля", "err")
+            return
+        self.profiles = [p for p in self.profiles if p["name"] != name]
+        self.profiles.append({"name": name, "settings": dict(self.settings)})
+        self.entry_profile.delete(0, "end")
+        self.save_config()
+        self.refresh_profiles()
+        self.toast(f"Профиль «{name}» сохранён", "ok")
+
+    def refresh_profiles(self):
+        for w in self.profile_rows.winfo_children():
+            w.destroy()
+        if not self.profiles:
+            ctk.CTkLabel(self.profile_rows, text="Профилей пока нет — настройте лаунчер и сохраните пресет.",
+                         font=F(11), text_color=MUTED).pack(anchor="w", padx=6, pady=6)
+            return
+        for prof in self.profiles:
+            row = ctk.CTkFrame(self.profile_rows, fg_color=CARD2, corner_radius=10)
+            row.pack(fill="x", padx=4, pady=3)
+            ctk.CTkLabel(row, text=prof["name"], font=F(12, "bold"),
+                         text_color=TEXT).pack(side="left", padx=(12, 8), pady=8)
+            s = prof.get("settings", {})
+            ctk.CTkLabel(row, text=f"граф. {s.get('graphics')} • FPS {s.get('fps')} • громк. {s.get('volume')}%",
+                         font=F(11), text_color=MUTED).pack(side="left")
+            ctk.CTkButton(row, text="✕", width=30, height=28, corner_radius=8, font=F(11),
+                          fg_color=CARD, hover_color=RED, text_color=MUTED,
+                          command=lambda n=prof["name"]: self.delete_profile(n)
+                          ).pack(side="right", padx=(0, 10), pady=6)
+            ctk.CTkButton(row, text="Загрузить", width=90, height=28, corner_radius=8, font=F(11, "bold"),
+                          fg_color=self.accent, hover_color=mix(self.accent, "#FFFFFF", 0.18),
+                          command=lambda n=prof["name"]: self.load_profile(n)
+                          ).pack(side="right", padx=(0, 6), pady=6)
+
+    def load_profile(self, name):
+        prof = next((p for p in self.profiles if p["name"] == name), None)
+        if not prof:
+            return
+        self.settings.update(prof.get("settings", {}))
+        self.save_config()
+        self.refresh_controls()
+        self.toast(f"Профиль «{name}» загружен", "ok")
+
+    def delete_profile(self, name):
+        self.profiles = [p for p in self.profiles if p["name"] != name]
+        self.save_config()
+        self.refresh_profiles()
+        self.toast(f"Профиль «{name}» удалён", "warn")
+
+    def refresh_controls(self):
+        self.accent = ACCENTS.get(self.settings["accent"], ACCENTS["Синий"])
+        self.slider_gfx.set(self.settings["graphics"])
+        self.lbl_gfx.configure(text=f"Уровень графики: {self.settings['graphics']} / 10")
+        self.var_shift.set(self.settings["shiftlock"])
+        self.slider_vol.set(self.settings["volume"])
+        self.lbl_vol.configure(text=f"Общая громкость: {self.settings['volume']}%")
+        self.var_mute.set(self.settings["volume"] == 0)
+        self.entry_fps.delete(0, "end")
+        self.entry_fps.insert(0, str(self.settings["fps"]))
+        self.var_showfps.set(self.settings["show_fps"])
+        self.var_postfx.set(self.settings["postfx_off"])
+        self.opt_render.set(self.settings["rendering"])
+        self.var_apply.set(self.settings["apply_on_launch"])
+        self.var_close.set(self.settings["close_after"])
+        self.entry_font.delete(0, "end")
+        self.entry_font.insert(0, self.settings["ui_font"])
+        self.slider_scale.set(self.settings["ui_scale"])
+        self.lbl_scale.configure(text=f"Масштаб текста: {int(round(self.settings['ui_scale'] * 100))}%")
+        self.opt_lcursor.set(self.settings["launcher_cursor"])
+        self.refresh_accent_widgets()
+        self.apply_ui_font()
+        self.apply_launcher_cursor()
+
+    def export_config(self):
+        path = filedialog.asksaveasfilename(title="Экспорт настроек", defaultextension=".json",
+                                            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            Path(path).write_text(json.dumps({"settings": self.settings, "games": self.games,
+                                              "profiles": self.profiles, "mods": self.mods},
+                                             indent=4, ensure_ascii=False), encoding="utf-8")
+            self.toast("Настройки экспортированы", "ok")
+        except Exception as e:
+            self.toast(f"Ошибка экспорта: {e}", "err")
+
+    def import_config(self):
+        path = filedialog.askopenfilename(title="Импорт настроек", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.settings.update(data.get("settings", {}))
+            if isinstance(data.get("games"), list):
+                self.games = [g for g in data["games"] if g.get("id")]
+            if isinstance(data.get("profiles"), list):
+                self.profiles = data["profiles"]
+            if isinstance(data.get("mods"), dict):
+                self.mods.update(data["mods"])
+            self.save_config()
+            self.refresh_controls()
+            self.rebuild_games()
+            self.refresh_profiles()
+            self.toast("Настройки импортированы", "ok")
+        except Exception as e:
+            self.toast(f"Ошибка импорта: {e}", "err")
+
+    def clear_logs(self):
+        d = self.core.roblox_root / "logs"
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+            self.toast("Логи Roblox очищены", "ok")
+        else:
+            self.toast("Папка логов не найдена", "warn")
+
+    # ---------------- О ПРОГРАММЕ ----------------
+    def build_about(self, container):
+        p = self.scroll(container)
+        self.page_head(p, "О программе", "Неофициальный лаунчер Roblox в стиле Bloxstrap.")
+        c = self.card(p)
+        ctk.CTkLabel(c, text="RBX Launcher v3.1", font=F(18, "bold"),
+                     text_color=TEXT).pack(anchor="w", padx=18, pady=(16, 4))
+        ctk.CTkLabel(c, text="Графика 1–10, Shift Lock, громкость, FPS-анлокер и FastFlags,\n"
+                             "замена звуков / шрифтов / курсоров игры с бэкапом и восстановлением,\n"
+                             "библиотека игр с иконками, профили, история запусков, своя иконка приложения.\n"
+                             "Не связан с Roblox Corporation.",
+                     font=F(12), text_color=MUTED, justify="left").pack(anchor="w", padx=18, pady=(0, 14))
+        c2 = self.card(p, "ИСТОРИЯ ЗАПУСКОВ")
+        self.history_frame = ctk.CTkFrame(c2, fg_color="transparent")
+        self.history_frame.pack(fill="x", padx=14, pady=(10, 14))
+        c3 = self.card(p, "ПУТИ")
+        self.lbl_paths = ctk.CTkLabel(c3, text="", font=F(11), text_color=MUTED,
+                                      justify="left", wraplength=660)
+        self.lbl_paths.pack(anchor="w", padx=18, pady=(12, 10))
+        r = ctk.CTkFrame(c3, fg_color="transparent")
+        r.pack(fill="x", padx=18, pady=(0, 16))
+        ctk.CTkButton(r, text="Папка Roblox", height=34, corner_radius=10, font=F(12), fg_color=CARD2,
+                      hover_color=BORDER, text_color=TEXT,
+                      command=lambda: self.open_path(self.core.roblox_root)).pack(side="left")
+        ctk.CTkButton(r, text="Папка бэкапов", height=34, corner_radius=10, font=F(12), fg_color=CARD2,
+                      hover_color=BORDER, text_color=TEXT,
+                      command=lambda: self.open_path(self.core.backup_dir)).pack(side="left", padx=(10, 0))
+
+    def refresh_history(self):
+        for w in self.history_frame.winfo_children():
+            w.destroy()
+        if not self.history:
+            ctk.CTkLabel(self.history_frame, text="Запусков пока не было.", font=F(11),
+                         text_color=MUTED).pack(anchor="w", padx=6, pady=6)
+            return
+        for h in self.history[:12]:
+            row = ctk.CTkFrame(self.history_frame, fg_color=CARD2, corner_radius=10)
+            row.pack(fill="x", padx=4, pady=3)
+            ctk.CTkLabel(row, text=h.get("name") or h.get("id"), font=F(12, "bold"),
+                         text_color=TEXT).pack(side="left", padx=(12, 8), pady=8)
+            ctk.CTkLabel(row, text=h.get("ts", ""), font=F(11), text_color=MUTED).pack(side="left")
+            ctk.CTkButton(row, text="▶ Ещё раз", width=90, height=28, corner_radius=8, font=F(11, "bold"),
+                          fg_color=GREEN, hover_color=GREEN_H,
+                          command=lambda i=h.get("id"), n=h.get("name"): self.launch_place(i, n)
+                          ).pack(side="right", padx=(0, 10), pady=6)
+
+    def refresh_recent(self):
+        for w in self.recent_frame.winfo_children():
+            w.destroy()
+        if not self.history:
+            ctk.CTkLabel(self.recent_frame, text="Здесь появятся последние запущенные игры.",
+                         font=F(11), text_color=MUTED).pack(anchor="w")
+            return
+        for h in self.history[:6]:
+            ctk.CTkButton(self.recent_frame, text=f"▶ {h.get('name') or h.get('id')}", height=32,
+                          corner_radius=10, font=F(12), fg_color=CARD, hover_color=CARD2,
+                          text_color=TEXT, border_width=1, border_color=BORDER,
+                          command=lambda i=h.get("id"), n=h.get("name"): self.launch_place(i, n)
+                          ).pack(side="left", padx=(0, 8), pady=2)
+
+    # ---------------- статус / тост ----------------
+    def build_toast(self):
+        self.toast_bar = ctk.CTkFrame(self, height=38, corner_radius=0, fg_color=SIDEBAR)
+        self.toast_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.toast_bar.grid_propagate(False)
+        self.toast_lbl = ctk.CTkLabel(self.toast_bar, text="Готов к запуску", font=F(12), text_color=MUTED)
+        self.toast_lbl.pack(side="left", padx=18)
+        self.toast_btn = ctk.CTkButton(self.toast_bar, text="Вернуть", width=80, height=26, corner_radius=8,
+                                       font=F(11, "bold"), fg_color=CARD2, hover_color=BORDER,
+                                       text_color=TEXT, command=self.do_undo)
+
+    def toast(self, msg, kind="info", undo=None):
+        colors = {"info": MUTED, "ok": GREEN, "warn": AMBER, "err": RED}
+        self.toast_lbl.configure(text=msg, text_color=colors.get(kind, MUTED))
+        self._undo = undo
+        if undo:
+            self.toast_btn.pack(side="right", padx=14)
+        else:
+            self.toast_btn.pack_forget()
+        if self._toast_after:
+            self.after_cancel(self._toast_after)
+        self._toast_after = self.after(6000, lambda: self.toast_lbl.configure(
+            text="Готов к запуску", text_color=MUTED))
+
+    def do_undo(self):
+        if self._undo:
+            fn, self._undo = self._undo, None
+            fn()
+        self.toast_btn.pack_forget()
+
+    def check_status(self):
+        ver = self.core.get_latest_version_dir()
+        if ver:
+            self.status_chip.configure(text=f"●  Клиент найден: {ver.name}", text_color=GREEN)
+        else:
+            self.status_chip.configure(text="●  Клиент Roblox не найден", text_color=RED)
+        self.lbl_paths.configure(text=f"Roblox:  {self.core.roblox_root}\nДанные:  {self.core.data_dir}")
+        self.lbl_flags_path.configure(text=str(ver / "ClientSettings" / "ClientAppSettings.json")
+                                      if ver else "Клиент не найден")
+
+    def open_path(self, path):
+        if not path:
+            self.toast("Папка не найдена", "err")
+            return
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path))
+        except Exception:
+            self.toast("Не удалось открыть папку", "err")
+
+    def open_clientsettings(self):
+        ver = self.core.get_latest_version_dir()
+        if ver:
+            self.open_path(ver / "ClientSettings")
+        else:
+            self.toast("Клиент Roblox не найден", "err")
+
+    # ---------------- живые настройки ----------------
+    def on_gfx(self, v):
+        self.settings["graphics"] = int(v)
+        self.lbl_gfx.configure(text=f"Уровень графики: {int(v)} / 10")
+        self.save_config()
+
+    def on_shift(self):
+        self.settings["shiftlock"] = self.var_shift.get()
+        self.save_config()
+
+    def on_volume(self, v):
+        v = int(v)
+        self.settings["volume"] = v
+        self.lbl_vol.configure(text=f"Общая громкость: {v}%")
+        self.var_mute.set(v == 0)
+        if v > 0:
+            self._prev_volume = v
+        self.save_config()
+
+    def on_mute(self):
+        if self.var_mute.get():
+            self._prev_volume = self.settings["volume"] or self._prev_volume
+            self.slider_vol.set(0)
+            self.on_volume(0)
+        else:
+            self.slider_vol.set(self._prev_volume)
+            self.on_volume(self._prev_volume)
+
+    def set_flag(self, key, value):
+        self.settings[key] = value
+        self.save_config()
+        self.core.apply_fast_flags(self.settings, quiet=True)
+        self.toast("FastFlags обновлены — применятся при запуске клиента", "ok")
+
+    def set_fps(self, v):
+        self.entry_fps.delete(0, "end")
+        self.entry_fps.insert(0, str(v))
+        self.commit_fps()
+
+    def commit_fps(self):
+        try:
+            v = max(0, min(1000, int(self.entry_fps.get())))
+        except ValueError:
+            v = 0
+        self.entry_fps.delete(0, "end")
+        self.entry_fps.insert(0, str(v))
+        self.set_flag("fps", v)
+
+    def apply_flags_now(self):
+        if self.core.apply_fast_flags(self.settings):
+            self.toast("FastFlags записаны в ClientAppSettings.json", "ok")
+        else:
+            self.toast("Клиент Roblox не найден", "err")
+
+    def on_restore(self):
+        if self.core.restore_backup():
+            self.toast("Оригинальные настройки Roblox восстановлены", "ok")
+        else:
+            self.toast("Бэкап ещё не создан", "warn")
+
+    def restore_one(self, cat, name):
+        if self.core.restore_client_file(cat, name):
+            if cat == "sounds":
+                self.mods["sounds"].pop(name, None)
+                self.save_config()
+            self.toast(f"Восстановлено: {name}", "ok")
+        else:
+            self.toast("Бэкап не найден", "warn")
+        self.refresh_mod_labels(cat)
+
+    def restore_cat(self, cat):
+        n = self.core.restore_category(cat)
+        if cat == "sounds":
+            self.mods["sounds"] = {}
+        elif cat == "fonts":
+            self.mods["font"] = None
+        elif cat == "cursors":
+            self.mods["cursor"] = None
+        self.save_config()
+        self.toast(f"Восстановлено файлов: {n}" if n else "Изменённых файлов не было",
+                     "ok" if n else "warn")
+        if cat == "sounds":
+            self.refresh_sound_rows()
+        elif cat == "fonts":
+            self.refresh_font_status()
+        else:
+            self.refresh_cursor_status()
+
+    def refresh_mod_labels(self, cat):
+        if cat == "sounds":
+            for name, lbl in self.sound_status.items():
+                mod = self.core.is_modified(cat, name)
+                try:
+                    lbl.configure(text="изменён" if mod else "оригинал",
+                                  text_color=AMBER if mod else MUTED)
+                except Exception:
+                    pass
+        elif cat == "fonts":
+            self.refresh_font_status()
+        elif cat == "cursors":
+            self.refresh_cursor_status()
+
+    def apply_preset(self, gfx, fps, post):
+        self.settings.update({"graphics": gfx, "fps": fps, "postfx_off": post})
+        self.save_config()
+        self.refresh_controls()
+        self.core.apply_fast_flags(self.settings, quiet=True)
+        self.toast(f"Пресет применён: графика {gfx}, FPS {fps}", "ok")
+
+    def set_accent(self, name):
+        self.settings["accent"] = name
+        self.accent = ACCENTS[name]
+        self.save_config()
+        self.refresh_accent_widgets()
+        self.toast(f"Акцент: {name}", "ok")
+
+    def refresh_accent_widgets(self):
+        a = self.accent
+        hov = mix(a, "#FFFFFF", 0.18)
+        for s in self._accent_sliders:
+            try:
+                s.configure(progress_color=a, button_color=a, button_hover_color=mix(a, "#FFFFFF", 0.25))
+            except Exception:
+                pass
+        for s in self._accent_switches:
+            try:
+                s.configure(progress_color=a)
+            except Exception:
+                pass
+        for b in self._accent_buttons:
+            try:
+                b.configure(fg_color=a, hover_color=hov)
+            except Exception:
+                pass
+        for n, b in self.swatches.items():
+            b.configure(border_color=TEXT if n == self.settings["accent"] else CARD)
+        try:
+            self.opt_render.configure(button_hover_color=a)
+            self.opt_lcursor.configure(button_hover_color=a)
+        except Exception:
+            pass
+        self.logo_img = ctk.CTkImage(make_logo(a), size=(42, 42))
+        self.logo_label.configure(image=self.logo_img)
+        for kind, b in self.cursor_buttons.items():
+            b.configure(image=ctk.CTkImage(make_cursor(kind, 48, a), size=(48, 48)))
+        self.regen_banner()
+        self.show_page(self.current_page)
+
+    # ---------------- баннер / сетка ----------------
+    def schedule_banner(self):
+        if self._banner_after:
+            self.after_cancel(self._banner_after)
+        self._banner_after = self.after(140, self.regen_banner)
+
+    def regen_banner(self):
+        w = self.banner.winfo_width()
+        h = self.banner.winfo_height()
+        if w < 50 or h < 50:
+            return
+        self.banner_ctk = ctk.CTkImage(make_banner(w, h, self.accent), size=(w, h))
+        self.banner_img_label.configure(image=self.banner_ctk)
+        self.banner_img_label.place(x=0, y=0)
+
+    def schedule_grid(self, width):
+        self._grid_width = width
+        if self._grid_after:
+            self.after_cancel(self._grid_after)
+        self._grid_after = self.after(140, self.rebuild_games)
+
+    def on_search(self):
+        self._search = self.entry_search.get().lower().strip()
+        self.rebuild_games()
+
+    def rebuild_games(self):
+        for w in self.games_grid.winfo_children():
+            w.destroy()
+        self.card_buttons.clear()
+        cols = max(2, (self._grid_width - 10) // 170)
+        shown = [g for g in self.games
+                 if self._search in (g.get("name") or "").lower() or self._search in g["id"]]
+        self.lbl_count.configure(text=f"{len(shown)} из {len(self.games)}")
+        if not shown:
+            ctk.CTkLabel(self.games_grid,
+                         text="Ничего не найдено. Вставьте Place ID внизу и нажмите «＋ В библиотеку».",
+                         font=F(12), text_color=MUTED).grid(row=0, column=0, columnspan=cols, pady=20)
+            return
+        for i, g in enumerate(shown):
+            self.make_card(g, i // cols, i % cols)
+
+    def make_card(self, g, row, col):
+        pid = g["id"]
+        name = g.get("name") or f"Place {pid}"
+        frame = ctk.CTkFrame(self.games_grid, fg_color="transparent")
+        frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+        self.games_grid.grid_columnconfigure(col, weight=1)
+        icon = self.icons.get(pid) or ctk.CTkImage(make_avatar(name, pid), size=(84, 84))
+        btn = ctk.CTkButton(frame, text=f"{name}\nID {pid}", image=icon, compound="top",
+                            width=160, height=170, corner_radius=14, font=F(12, "bold"),
+                            fg_color=CARD, hover_color=CARD2, border_width=1, border_color=BORDER,
+                            text_color=TEXT, command=lambda p=pid, n=name: self.launch_place(p, n))
+        btn.pack(fill="both", expand=True)
+        self.card_buttons[pid] = btn
+        ctk.CTkButton(frame, text="✕", width=24, height=24, corner_radius=12, font=F(11, "bold"),
+                      fg_color=mix(CARD, "#000000", 0.25), hover_color=RED, text_color=MUTED,
+                      command=lambda p=pid: self.delete_game(p)).place(relx=1.0, x=-8, y=8, anchor="ne")
+
+    # ---------------- библиотека ----------------
+    def load_icons(self):
+        for g in self.games:
+            f = self.core.icons_dir / f"{g['id']}.png"
+            if f.exists():
+                try:
+                    self.icons[g["id"]] = ctk.CTkImage(Image.open(f).convert("RGBA"), size=(84, 84))
+                    continue
+                except Exception:
+                    pass
+            threading.Thread(target=self.fetch_worker, args=(g["id"],), daemon=True).start()
+
+    def fetch_worker(self, pid):
+        info = RobloxCore.fetch_remote(pid)
+        try:
+            self.after(0, lambda: self.apply_remote(pid, info))
+        except Exception:
+            pass
+
+    def apply_remote(self, pid, info):
+        game = next((g for g in self.games if g["id"] == pid), None)
+        if not game:
+            return
+        changed = False
+        if info.get("name") and (not game.get("name") or game["name"] == f"Place {pid}"):
+            game["name"] = info["name"]
+            changed = True
+        if info.get("icon"):
+            try:
+                (self.core.icons_dir / f"{pid}.png").write_bytes(info["icon"])
+                self.icons[pid] = ctk.CTkImage(Image.open(io.BytesIO(info["icon"])).convert("RGBA"),
+                                               size=(84, 84))
+                changed = True
+            except Exception:
+                pass
+        if changed:
+            self.save_config()
+            btn = self.card_buttons.get(pid)
+            if btn:
+                try:
+                    btn.configure(text=f"{game.get('name')}\nID {pid}", image=self.icons.get(pid))
+                except Exception:
+                    pass
+
+    def on_add(self):
+        pid = RobloxCore.parse_place_id(self.entry_place.get())
+        if not pid:
+            self.toast("Введите Place ID или ссылку на игру", "err")
+            return
+        if any(g["id"] == pid for g in self.games):
+            self.toast("Эта игра уже в библиотеке", "warn")
+            return
+        self.games.append({"id": pid, "name": f"Place {pid}"})
+        self.save_config()
+        self.entry_place.delete(0, "end")
+        self.rebuild_games()
+        threading.Thread(target=self.fetch_worker, args=(pid,), daemon=True).start()
+        self.toast(f"Игра {pid} добавлена в библиотеку", "ok")
+
+    def delete_game(self, pid):
+        idx = next((i for i, g in enumerate(self.games) if g["id"] == pid), None)
+        if idx is None:
+            return
+        removed = self.games.pop(idx)
+        self.save_config()
+        self.rebuild_games()
+        self.toast(f"Удалено: {removed.get('name')}", "warn",
+                   undo=lambda: self.restore_game(idx, removed))
+
+    def restore_game(self, idx, game):
+        self.games.insert(min(idx, len(self.games)), game)
+        self.save_config()
+        self.rebuild_games()
+        self.toast(f"Возвращено: {game.get('name')}", "ok")
+
+    # ---------------- запуск ----------------
+    def record_history(self, pid, name):
+        self.history = [h for h in self.history if h.get("id") != pid]
+        self.history.insert(0, {"id": pid, "name": name or f"Place {pid}",
+                                "ts": time.strftime("%d.%m.%Y %H:%M")})
+        self.history = self.history[:12]
+        self.save_config()
+        self.refresh_recent()
+
+    def apply_before_launch(self, quiet):
+        if not self.settings["apply_on_launch"]:
+            return
+        vol = 0 if self.var_mute.get() else self.settings["volume"]
+        self.core.apply_xml_settings(self.settings["graphics"], self.settings["shiftlock"], vol, quiet=quiet)
+        self.core.apply_fast_flags(self.settings, quiet=True)
+
+    def after_launch(self):
+        if self.settings["close_after"]:
+            self.after(900, self.destroy)
+
+    def launch_place(self, pid, name=None):
+        self.apply_before_launch(quiet=True)
+        self.core.launch_place(pid)
+        self.record_history(pid, name)
+        self.toast(f"Запуск: {name or pid} …", "ok")
+        self.after_launch()
+
+    def on_menu(self):
+        self.apply_before_launch(quiet=False)
+        if self.core.launch_menu():
+            self.toast("Запуск клиента Roblox …", "ok")
+        self.after_launch()
+
+    def on_play(self):
+        pid = RobloxCore.parse_place_id(self.entry_place.get())
+        self.apply_before_launch(quiet=False)
+        if pid:
+            game = next((g for g in self.games if g["id"] == pid), None)
+            self.core.launch_place(pid)
+            self.record_history(pid, game.get("name") if game else None)
+            self.toast(f"Запуск игры {pid} …", "ok")
+        else:
+            if self.core.launch_menu():
+                self.toast("Запуск клиента Roblox …", "ok")
+        self.after_launch()
+
+
+if __name__ == "__main__":
+    set_taskbar_id()
+    app = LauncherApp()
+
+    def fix_russian_shortcuts(event):
+        if event.state & 0x4:
+            if event.keycode == 86:
+                event.widget.event_generate("<<Paste>>")
+                return "break"
+            elif event.keycode == 67:
+                event.widget.event_generate("<<Copy>>")
+                return "break"
+            elif event.keycode == 88:
+                event.widget.event_generate("<<Cut>>")
+                return "break"
+            elif event.keycode == 65:
+                event.widget.event_generate("<<SelectAll>>")
+                return "break"
+
+    app.bind_all("<KeyPress>", fix_russian_shortcuts, add="+")
+    app.mainloop()
+
